@@ -17,68 +17,123 @@
 
 import json
 import os
+import folium
+import numpy as np
 
 from flask import Flask
 from flask import jsonify
 from flask import render_template
 from flask import request
 from flask import url_for
-from googleapiclient import discovery
-from oauth2client.client import GoogleCredentials
-
-from google.appengine.api import app_identity
-
-
-credentials = GoogleCredentials.get_application_default()
-api = discovery.build('ml', 'v1', credentials=credentials)
-project = app_identity.get_application_id()
-model_name = os.getenv('MODEL_NAME', 'babyweight')
-
 
 app = Flask(__name__)
 
+def make_random_point(x_lng, y_lat, distance):
+    # distance in meter
+    r = distance / 111300
+    u = np.random.uniform(0, 1)
+    v = np.random.uniform(0, 1)
+    w = r * np.sqrt(u)
+    t = 2 * np.pi * v
+    x = w * np.cos(t)
+    x1 = x / np.cos(y_lat)
+    y = w * np.sin(t)
+    return x_lng + x1, y_lat + y, x1, y
 
-def get_prediction(features):
-  input_data = {'instances': [features]}
-  parent = 'projects/%s/models/%s' % (project, model_name)
-  prediction = api.projects().predict(body=input_data, name=parent).execute()
-  return prediction['predictions'][0]['predictions'][0]
+
+def make_synthetic_gps_trace(path_list, noise, sampling):
+    synthetic_gps_trace = []
+    trip_to_match = {}
+    for idx, fix in enumerate(path_list):
+        if idx % sampling == 0:
+            gps_lng, gps_lat, gps_lng_noise, gps_lat_noise = make_random_point(fix['lng'], fix['lat'], noise)
+            gps_fix = {'location': {'latitude': gps_lat,
+                                    'longitude': gps_lng,
+                                    'precision': gps_lng_noise + gps_lat_noise}
+                       }
+            synthetic_gps_trace.append(gps_fix)
+    trip_to_match['google_label_path'] = [[fix['lat'], fix['lng']] for idx, fix in enumerate(path_list)]
+    trip_to_match['fixes'] = synthetic_gps_trace
+
+    return synthetic_gps_trace, trip_to_match
 
 
-@app.route('/')
+def write_folium_google_input_trip(path_list, synthetic_gps_trace_list):
+    Map = folium.Map()
+
+    google_input_layer = folium.FeatureGroup("Google input points")
+    google_path_layer = folium.FeatureGroup("Google input path")
+    synthetic_gps_layer = folium.FeatureGroup("Synthetic GPS points")
+
+    startpoint_lat = path_list[0]['lat']
+    startpoint_lon = path_list[0]['lng']
+
+    Map.fit_bounds(bounds=[[
+        startpoint_lat - 1 / 110,
+        startpoint_lon - 1 / (110 * np.cos(startpoint_lat))
+    ], [
+        startpoint_lat + 1 / 110,
+        startpoint_lon + 1 / (110 * np.cos(startpoint_lat))
+    ]])
+
+    for idx, fix in enumerate(path_list):
+        google_lat = fix['lat']
+        google_lon = fix['lng']
+        google_popup = "Google Input Point #{}".format(idx)
+        folium.CircleMarker(location=[google_lat, google_lon],
+                            color='black',
+                            radius=4,
+                            popup=google_popup).add_to(google_input_layer)
+
+    google_polyline = folium.PolyLine(locations=[[fix['lat'], fix['lng']] for idx, fix in enumerate(path_list)],
+                                      weight=3,
+                                      color='green')
+    google_path_layer.add_child(google_polyline)
+
+    for idx, fix in enumerate(synthetic_gps_trace_list):
+        gps_lat = fix['location']['latitude']
+        gps_lon = fix['location']['longitude']
+        gps_popup = "Synthetic GPS Point #{}".format(idx)
+        folium.CircleMarker(location=[gps_lat, gps_lon],
+                            color='red',
+                            radius=6,
+                            popup=gps_popup).add_to(synthetic_gps_layer)
+
+    Map.add_child(google_input_layer)
+    Map.add_child(synthetic_gps_layer)
+    Map.add_child(google_path_layer)
+    Map.add_child(folium.LayerControl())
+
+    html_title = "templates/google_input_latest.html"
+    Map.save(outfile=html_title)
+
+
+@app.route('/', methods=['GET', 'POST'])
 def index():
-  return render_template('index.html')
+    return render_template('maps_draggable_directions.html')
 
 
-@app.route('/form')
-def input_form():
-  return render_template('form.html')
+@app.route('/generate_gps_trace', methods=['GET', 'POST'])
+def generate_gps_trace():
+    noise = int(request.form['noise'])
+    sampling = int(request.form['sampling'])
+    total = request.form['total']
+    response = json.loads(request.form['response'])
+    mapmatching = request.form['mapmatching']
+    print("noise: {}, sampling: {}, total: {}, mapmatch: {}".format(noise, sampling, total, mapmatching))
+    if mapmatching == 'true':
+        overview_path = response['routes'][0]['overview_path']
+        synthetic_gps_trace, trip_to_match = make_synthetic_gps_trace(overview_path, noise, sampling)
+        write_folium_google_input_trip(overview_path, synthetic_gps_trace)
+        #mapmatch(trip_to_match)
+        return render_template('form.html')
+    else:
+        overview_path = response['routes'][0]['overview_path']
+        synthetic_gps_trace, trip_to_match = make_synthetic_gps_trace(overview_path, noise, sampling)
+        write_folium_google_input_trip(overview_path, synthetic_gps_trace)
+        #mapmatch(trip_to_match)
+        return render_template('google_input_latest.html')
 
 
-@app.route('/api/predict', methods=['POST'])
-def predict():
-  def gender2str(val):
-    genders = {'unknown': 'Unknown', 'male': 'True', 'female': 'False'}
-    return genders[val]
+app.run()
 
-  def plurality2str(val):
-    pluralities = {'1': 'Single(1)', '2': 'Twins(2)', '3': 'Triplets(3)'}
-    if features['is_male'] == 'Unknown' and int(val) > 1:
-      return 'Multiple(2+)'
-    return pluralities[val]
-
-  data = json.loads(request.data.decode())
-  mandatory_items = ['baby_gender', 'mother_age',
-                     'plurality', 'gestation_weeks']
-  for item in mandatory_items:
-    if item not in data.keys():
-      return jsonify({'result': 'Set all items.'})
-
-  features = {}
-  features['is_male'] = gender2str(data['baby_gender'])
-  features['mother_age'] = float(data['mother_age'])
-  features['plurality'] = plurality2str(data['plurality'])
-  features['gestation_weeks'] = float(data['gestation_weeks'])
-
-  prediction = get_prediction(features)
-  return jsonify({'result': '{:.2f} lbs.'.format(prediction)})
